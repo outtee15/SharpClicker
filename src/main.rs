@@ -1,4 +1,3 @@
-// Hides the console window in release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering::Relaxed};
@@ -19,10 +18,8 @@ const AMBER: Color32 = Color32::from_rgb(245, 158, 11);
 const PANEL: Color32 = Color32::from_rgb(24, 24, 30);
 const CARD: Color32 = Color32::from_rgb(34, 34, 44);
 
-/// With the backlog guard on, clicks are never sent faster than this (ms).
 const MIN_SAFE_MS: u64 = 10;
 
-/// Everything that gets saved between launches.
 #[derive(Clone)]
 struct Config {
     hours: u64,
@@ -31,6 +28,7 @@ struct Config {
     millis: u64,
     always_on_top: bool,
     backlog_guard: bool,
+    guard_ms: u64,
     button_idx: u8,
     hotkey: Keycode,
 }
@@ -41,9 +39,10 @@ impl Default for Config {
             hours: 0,
             minutes: 0,
             seconds: 0,
-            millis: 1,            // default: 1 millisecond
-            always_on_top: false, // default: off
+            millis: 1,
+            always_on_top: false,
             backlog_guard: true,
+            guard_ms: MIN_SAFE_MS,
             button_idx: 0,
             hotkey: Keycode::F6,
         }
@@ -51,13 +50,12 @@ impl Default for Config {
 }
 
 impl Config {
-    /// %APPDATA%\SharpClicker\settings.txt
+
     fn path() -> Option<PathBuf> {
         std::env::var_os("APPDATA")
             .map(|p| PathBuf::from(p).join("SharpClicker").join("settings.txt"))
     }
 
-    /// Loads saved settings; anything missing or invalid falls back to the default.
     fn load() -> Self {
         let mut cfg = Config::default();
         let Some(path) = Self::path() else { return cfg };
@@ -89,6 +87,11 @@ impl Config {
                 }
                 "always_on_top" => cfg.always_on_top = v == "true",
                 "backlog_guard" => cfg.backlog_guard = v == "true",
+                "guard_ms" => {
+                    if let Ok(n) = v.parse::<u64>() {
+                        cfg.guard_ms = n.clamp(1, 100);
+                    }
+                }
                 "button" => {
                     if let Ok(n) = v.parse::<u8>() {
                         cfg.button_idx = n.min(2);
@@ -109,13 +112,14 @@ impl Config {
 
     fn to_text(&self) -> String {
         format!(
-            "hours={}\nminutes={}\nseconds={}\nmillis={}\nalways_on_top={}\nbacklog_guard={}\nbutton={}\nhotkey={:?}\n",
+            "hours={}\nminutes={}\nseconds={}\nmillis={}\nalways_on_top={}\nbacklog_guard={}\nguard_ms={}\nbutton={}\nhotkey={:?}\n",
             self.hours,
             self.minutes,
             self.seconds,
             self.millis,
             self.always_on_top,
             self.backlog_guard,
+            self.guard_ms,
             self.button_idx,
             self.hotkey,
         )
@@ -134,14 +138,13 @@ impl Config {
 struct Shared {
     running: AtomicBool,
     interval_ms: AtomicU64,
-    button: AtomicU8, // 0 = left, 1 = right, 2 = middle
+    button: AtomicU8,
     clicks: AtomicU64,
     hotkey: Mutex<Keycode>,
-    capturing: AtomicBool, // true while waiting for the user to press a new hotkey
-    backlog_guard: AtomicBool, // caps click rate so the OS input queue can't pile up
+    capturing: AtomicBool,
+    backlog_guard: AtomicBool,
+    guard_ms: AtomicU64,
 
-    // This app's own window rectangle in physical screen pixels.
-    // The clicker never clicks while the cursor is inside it.
     rect_valid: AtomicBool,
     rx0: AtomicI32,
     ry0: AtomicI32,
@@ -176,18 +179,18 @@ fn spawn_clicker(shared: Arc<Shared>) {
 
             let now = Instant::now();
             if now < next {
-                // Plain sleep: no busy-spinning, so no wasted CPU / lag.
+
                 thread::sleep(next - now);
                 continue;
             }
 
             let mut ms = shared.interval_ms.load(Relaxed).max(1);
-            if shared.backlog_guard.load(Relaxed) && ms < MIN_SAFE_MS {
-                ms = MIN_SAFE_MS;
+            let guard = shared.guard_ms.load(Relaxed).max(1);
+            if shared.backlog_guard.load(Relaxed) && ms < guard {
+                ms = guard;
             }
             let iv = Duration::from_millis(ms);
 
-            // Safety: never click on this app's own window.
             if cursor_over_app(&shared, &device) {
                 shared.paused_over_app.store(true, Relaxed);
                 next = Instant::now() + Duration::from_millis(20);
@@ -206,16 +209,12 @@ fn spawn_clicker(shared: Arc<Shared>) {
             next += iv;
             let after = Instant::now();
             if next < after {
-                next = after + iv; // never burst-catch-up if we fell behind
+                next = after + iv;
             }
         }
     });
 }
 
-/// Global hotkey thread:
-///  - DELETE always stops clicking and kills the whole process
-///  - the chosen toggle key starts/stops clicking
-///  - captures a new toggle key when asked
 fn spawn_hotkey(shared: Arc<Shared>) {
     thread::spawn(move || {
         let device = DeviceState::new();
@@ -223,7 +222,6 @@ fn spawn_hotkey(shared: Arc<Shared>) {
         loop {
             let keys = device.get_keys();
 
-            // Kill switch: works from any window, even while rebinding.
             if keys.contains(&Keycode::Delete) {
                 shared.running.store(false, Relaxed);
                 std::process::exit(0);
@@ -233,7 +231,7 @@ fn spawn_hotkey(shared: Arc<Shared>) {
                 if let Some(&k) = keys.first() {
                     *shared.hotkey.lock().unwrap() = k;
                     shared.capturing.store(false, Relaxed);
-                    was_down = true; // ignore this press so it doesn't toggle immediately
+                    was_down = true;
                 }
             } else {
                 let hk = *shared.hotkey.lock().unwrap();
@@ -256,9 +254,10 @@ struct App {
     millis: u64,
     always_on_top: bool,
     backlog_guard: bool,
+    guard_ms: u64,
     button_idx: u8,
     shared: Arc<Shared>,
-    // autosave bookkeeping
+
     pending: String,
     pending_since: Instant,
     last_saved: String,
@@ -298,6 +297,7 @@ impl App {
             hotkey: Mutex::new(cfg.hotkey),
             capturing: AtomicBool::new(false),
             backlog_guard: AtomicBool::new(cfg.backlog_guard),
+            guard_ms: AtomicU64::new(cfg.guard_ms),
             rect_valid: AtomicBool::new(false),
             rx0: AtomicI32::new(0),
             ry0: AtomicI32::new(0),
@@ -316,6 +316,7 @@ impl App {
             millis: cfg.millis,
             always_on_top: cfg.always_on_top,
             backlog_guard: cfg.backlog_guard,
+            guard_ms: cfg.guard_ms,
             button_idx: cfg.button_idx,
             shared,
             pending: text.clone(),
@@ -338,7 +339,6 @@ impl App {
         });
     }
 
-    /// Saves settings shortly after they stop changing (or immediately if `force`).
     fn autosave(&mut self, force: bool) {
         let cfg = Config {
             hours: self.hours,
@@ -347,6 +347,7 @@ impl App {
             millis: self.millis,
             always_on_top: self.always_on_top,
             backlog_guard: self.backlog_guard,
+            guard_ms: self.guard_ms,
             button_idx: self.button_idx,
             hotkey: *self.shared.hotkey.lock().unwrap(),
         };
@@ -363,7 +364,6 @@ impl App {
         }
     }
 
-    /// Publish this window's screen rectangle so the clicker can avoid it.
     fn publish_window_rect(&self, ctx: &egui::Context) {
         let ppp = ctx.pixels_per_point();
         let (rect, minimized) = ctx.input(|i| {
@@ -386,7 +386,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Closing the window always stops clicking first.
+
         if ctx.input(|i| i.viewport().close_requested()) {
             self.shared.running.store(false, Relaxed);
             self.autosave(true);
@@ -394,13 +394,13 @@ impl eframe::App for App {
 
         self.publish_window_rect(ctx);
 
-        // Never allow a 0 ms interval.
         if self.total_ms() == 0 {
             self.millis = 1;
         }
         self.shared.interval_ms.store(self.total_ms(), Relaxed);
         self.shared.button.store(self.button_idx, Relaxed);
         self.shared.backlog_guard.store(self.backlog_guard, Relaxed);
+        self.shared.guard_ms.store(self.guard_ms, Relaxed);
         self.autosave(false);
 
         let running = self.shared.running.load(Relaxed);
@@ -420,7 +420,6 @@ impl eframe::App for App {
             );
             ui.add_space(6.0);
 
-            // Interval card
             egui::Frame::none()
                 .fill(CARD)
                 .rounding(Rounding::same(12.0))
@@ -435,7 +434,6 @@ impl eframe::App for App {
                     });
                 });
 
-            // Mouse button card
             egui::Frame::none()
                 .fill(CARD)
                 .rounding(Rounding::same(12.0))
@@ -449,7 +447,6 @@ impl eframe::App for App {
                     });
                 });
 
-            // Settings card
             egui::Frame::none()
                 .fill(CARD)
                 .rounding(Rounding::same(12.0))
@@ -457,7 +454,6 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     ui.label(RichText::new("Settings").strong());
 
-                    // Always on top (default: off)
                     if ui
                         .checkbox(&mut self.always_on_top, "Show above other apps")
                         .changed()
@@ -470,11 +466,16 @@ impl eframe::App for App {
                         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
                     }
 
-                    // Backlog guard
-                    ui.checkbox(&mut self.backlog_guard, "Backlog guard (stops leftover clicks)")
-                        .on_hover_text("Caps clicking at 100/sec (10 ms). Faster rates can flood the target app's input queue, so clicks keep landing after you stop.");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.backlog_guard, "Backlog guard")
+                            .on_hover_text("Stops leftover clicks after you press stop by never sending clicks faster than the app under the cursor can handle.");
+                        ui.add_enabled(
+                            self.backlog_guard,
+                            egui::DragValue::new(&mut self.guard_ms).range(1..=100).suffix(" ms"),
+                        )
+                        .on_hover_text("Minimum time between clicks. Lower it until leftover clicks start appearing after you stop, then raise it a little.");
+                    });
 
-                    // Hotkey rebinding
                     ui.horizontal(|ui| {
                         ui.label("Toggle key:");
                         let label = if capturing {
@@ -490,7 +491,6 @@ impl eframe::App for App {
 
             ui.add_space(2.0);
 
-            // Single start / stop toggle button
             let (text, color) = if running {
                 ("■  Stop", RED)
             } else {
@@ -516,9 +516,9 @@ impl eframe::App for App {
                 ui.label(RichText::new("●").color(dot));
                 ui.label(status);
             });
-            if self.backlog_guard && self.total_ms() < MIN_SAFE_MS {
+            if self.backlog_guard && self.total_ms() < self.guard_ms {
                 ui.label(
-                    RichText::new(format!("Effective interval: {MIN_SAFE_MS} ms (backlog guard on)"))
+                    RichText::new(format!("Effective interval: {} ms (backlog guard on)", self.guard_ms))
                         .size(12.0)
                         .color(AMBER),
                 );
@@ -529,15 +529,10 @@ impl eframe::App for App {
             );
         });
 
-        // Keep UI in sync with the global hotkey and click counter.
         ctx.request_repaint_after(Duration::from_millis(100));
     }
 }
 
-/// Loads src/icon.ico for the window / taskbar icon.
-/// Reads the ICO directory by hand, picks the largest image and decodes it as PNG
-/// (any PNG colour type works). Never panics: returns None if anything is wrong,
-/// and the window just uses the default icon.
 fn load_icon() -> Option<egui::IconData> {
     let bytes: &[u8] = include_bytes!("icon.ico");
     if bytes.len() < 6 {
@@ -545,7 +540,6 @@ fn load_icon() -> Option<egui::IconData> {
     }
     let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
 
-    // (width, data offset, data length) of the largest entry
     let mut best: Option<(u32, usize, usize)> = None;
     for i in 0..count {
         let e = 6 + i * 16;
@@ -598,6 +592,6 @@ fn main() {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, cfg)))),
     );
-    // Force the whole process (including background threads) to exit.
+
     std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
