@@ -3,6 +3,8 @@ name = "sharpclicker"
 version = "0.1.0"
 edition = "2024"
 build = "build.rs"
+license = "MIT"
+license-file = "LICENSE.txt"
 
 [dependencies]
 eframe = "0.29"
