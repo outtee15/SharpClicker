@@ -30,7 +30,7 @@ You'll need:
 Then:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/SharpClicker.git
+git clone https://github.com/outtee15/SharpClicker.git
 cd SharpClicker
 cargo run --release
 ```
