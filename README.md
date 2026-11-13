@@ -2,7 +2,7 @@
 
 A fast, dark-themed autoclicker for Windows, written in Rust with [egui](https://github.com/emilk/egui).
 
-![SharpClicker screenshot](docs/screenshot.png)
+![SharpClicker screenshot](screenshot.png)
 
 ## Features
 
