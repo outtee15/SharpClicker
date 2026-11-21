@@ -1,4 +1,3 @@
-// Embeds src/icon.ico as the icon of the built .exe (what Explorer / the taskbar shows).
 fn main() {
     println!("cargo:rerun-if-changed=src/icon.ico");
 
